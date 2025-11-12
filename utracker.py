@@ -1,20 +1,19 @@
-# Add to imports in utracker.py
 import uuid
-from datetime import datetime
-
-# Add UUID and timestamp helpers
-def generate_id():
-    return str(uuid.uuid4())
-
-def get_current_timestamp():
-    return datetime.now().isoformat()
-
+from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
-from datetime import datetime
 import sqlite3
 import os
 import re
+import sys
+
+
+def generate_id():
+    return str(uuid.uuid4())
+
+
+def get_current_timestamp():
+    return datetime.now().isoformat()
 
 
 class LoginWindow:
@@ -84,6 +83,134 @@ class LoginWindow:
             self.username_entry.focus_set()
 
 
+class AutocompleteEntry(ttk.Entry):
+    def __init__(self, parent, app, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.app = app
+        self.var = tk.StringVar()
+        self.config(textvariable=self.var, font=("Arial", 14))
+
+        # Create a Toplevel window for suggestions
+        self.suggestion_window = tk.Toplevel(parent)
+        self.suggestion_window.wm_overrideredirect(True)
+        self.suggestion_window.wm_transient(parent)
+        self.suggestion_window.configure(bg="white", relief="solid", borderwidth=1)
+
+        self.listbox = tk.Listbox(self.suggestion_window,
+                                  font=("Arial", 12),
+                                  bg="white",
+                                  relief="flat",
+                                  borderwidth=0,
+                                  highlightthickness=0,
+                                  selectmode="single")
+        self.listbox.pack(fill=tk.BOTH, expand=True)
+        self.listbox.bind('<<ListboxSelect>>', self.on_select)
+
+        self.var.trace('w', self.on_change)
+        self.bind('<Key-Up>', self.on_up)
+        self.bind('<Key-Down>', self.on_down)
+        self.bind('<Return>', self.on_enter)
+        self.bind('<Escape>', self.hide_listbox)
+        self.bind('<FocusOut>', lambda e: self.hide_listbox())
+
+        self.suggestions = []
+        self.suggestion_window.withdraw()
+
+    def on_change(self, *args):
+        self.update_suggestions()
+
+    def update_suggestions(self):
+        typed = self.var.get().lower()
+        if not typed:
+            self.hide_listbox()
+            return
+
+        # Filter suggestions based on input
+        self.suggestions = [name for name in self.app.all_borrowers if typed in name.lower()]
+
+        if self.suggestions:
+            self.show_suggestions()
+        else:
+            self.hide_listbox()
+
+    def show_suggestions(self):
+        # Get the absolute screen position of the entry
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self.winfo_height()
+
+        # Update listbox content
+        self.listbox.delete(0, tk.END)
+        for suggestion in self.suggestions[:8]:  # Show max 8 suggestions
+            self.listbox.insert(tk.END, suggestion)
+
+        # Calculate the exact height needed for the suggestions
+        item_count = min(8, len(self.suggestions))
+        item_height = 20  # Approximate height per item in pixels
+        total_height = item_count * item_height
+
+        # Set the window size to fit the content exactly
+        width = self.winfo_width()
+        self.suggestion_window.geometry(f"{width}x{total_height}+{x}+{y}")
+        self.suggestion_window.deiconify()
+        self.suggestion_window.lift()
+
+        # Select first item by default
+        if self.suggestions:
+            self.listbox.selection_set(0)
+            self.listbox.activate(0)
+
+    def hide_listbox(self, event=None):
+        self.suggestion_window.withdraw()
+
+    def on_select(self, event):
+        if self.listbox.curselection():
+            index = self.listbox.curselection()[0]
+            value = self.listbox.get(index)
+            self.var.set(value)
+            self.hide_listbox()
+            self.icursor(tk.END)
+
+    def on_up(self, event):
+        if self.suggestion_window.winfo_viewable():
+            current = self.listbox.curselection()
+            if current:
+                index = current[0]
+                if index > 0:
+                    self.listbox.selection_clear(0, tk.END)
+                    self.listbox.selection_set(index - 1)
+                    self.listbox.activate(index - 1)
+            else:
+                self.listbox.selection_set(0)
+                self.listbox.activate(0)
+            return 'break'
+
+    def on_down(self, event):
+        if self.suggestion_window.winfo_viewable():
+            current = self.listbox.curselection()
+            if current:
+                index = current[0]
+                if index < len(self.suggestions) - 1 and index < 7:
+                    self.listbox.selection_clear(0, tk.END)
+                    self.listbox.selection_set(index + 1)
+                    self.listbox.activate(index + 1)
+            else:
+                self.listbox.selection_set(0)
+                self.listbox.activate(0)
+            return 'break'
+        else:
+            self.update_suggestions()
+            return 'break'
+
+    def on_enter(self, event):
+        if self.suggestion_window.winfo_viewable() and self.listbox.curselection():
+            self.on_select(event)
+            return 'break'
+        elif self.suggestions and not self.suggestion_window.winfo_viewable():
+            self.var.set(self.suggestions[0])
+            self.icursor(tk.END)
+            return 'break'
+
+
 class UtangTrackerApp:
     def __init__(self, root):
         self.root = root
@@ -144,7 +271,8 @@ class UtangTrackerApp:
         form_frame = tk.Frame(root, bg=self.current_bg_color)
         form_frame.pack(pady=10)
 
-        labels = ["Account Name:", "Actual Borrower:", "Product:", "Quantity:", "Amount (₱):"]
+        # Updated labels: Account Name -> Borrower, Actual Borrower -> Co-borrower
+        labels = ["Borrower:", "Co-borrower:", "Product:", "Quantity:", "Amount (₱):"]
         self.entries = {}
 
         for i, label in enumerate(labels):
@@ -157,6 +285,10 @@ class UtangTrackerApp:
                                    width=5, increment=1)
                 entry.delete(0, tk.END)
                 entry.insert(0, "0")
+            elif label == "Borrower:":
+                # Get all borrower names for autocomplete
+                self.all_borrowers = self.get_all_borrower_names()
+                entry = AutocompleteEntry(form_frame, self, font=("Arial", 14), width=25)
             else:
                 entry = tk.Entry(form_frame, font=("Arial", 14), width=25)
 
@@ -184,6 +316,10 @@ class UtangTrackerApp:
             if text != "Clear":
                 self.entries[text] = btn  # Store buttons for enabling/disabling
 
+        reminder_btn = tk.Button(button_frame, text="View Reminders", command=self.check_for_reminders,
+                                 font=("Arial", 14), width=18, height=2, bg="#FF9999", fg="white")
+        reminder_btn.grid(row=0, column=4, padx=10, pady=10)
+
         # Table frame with scrollbar
         self.table_frame = tk.Frame(root, bg=self.current_bg_color)
         self.table_frame.pack(pady=10, fill=tk.BOTH, expand=True)
@@ -193,7 +329,7 @@ class UtangTrackerApp:
         self.tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         # Main table columns
-        columns = ("Last Transaction", "Account Name", "Balance")
+        columns = ("Last Transaction", "Borrower", "Balance")
         self.tree = ttk.Treeview(self.table_frame, columns=columns, show="headings",
                                  yscrollcommand=self.tree_scrollbar.set)
         self.tree_scrollbar.config(command=self.tree.yview)
@@ -202,8 +338,8 @@ class UtangTrackerApp:
         self.tree.heading("Last Transaction", text="Last Transaction")
         self.tree.column("Last Transaction", anchor="center", width=150)
 
-        self.tree.heading("Account Name", text="Account Name")
-        self.tree.column("Account Name", anchor="center", width=200)
+        self.tree.heading("Borrower", text="Borrower")
+        self.tree.column("Borrower", anchor="center", width=200)
 
         self.tree.heading("Balance", text="Balance")
         self.tree.column("Balance", anchor="center", width=150)
@@ -224,6 +360,305 @@ class UtangTrackerApp:
 
         # Initialize data
         self.refresh_table()
+
+        # Start the automatic sync cycle 5 seconds after the app launches
+        self.root.after(5000, self.auto_sync)
+
+        # ADD THIS LINE to check for reminders 2 seconds after startup
+        self.root.after(2000, self.check_startup_reminders)
+
+    def auto_delete_zero_balance(self):
+        """Automatically delete customers with zero balance for more than 1 week"""
+        print("Checking for zero balance customers to delete...")
+        conn = self.get_db_connection()
+
+        try:
+            cursor = conn.cursor()
+
+            # Calculate date 1 week ago
+            one_week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+
+            # Find customers with zero balance and no transactions in the last week
+            cursor.execute("""
+                SELECT c.id, c.display_name 
+                FROM customers c
+                WHERE c.balance = 0 
+                AND c.updated_at < ?
+                AND NOT EXISTS (
+                    SELECT 1 FROM transactions t 
+                    WHERE t.customer_id = c.id 
+                    AND t.created_at > ?
+                )
+            """, (one_week_ago, one_week_ago))
+
+            customers_to_delete = cursor.fetchall()
+
+            if customers_to_delete:
+                deleted_count = 0
+                for customer_id, display_name in customers_to_delete:
+                    # Delete customer and their transactions
+                    cursor.execute('DELETE FROM transactions WHERE customer_id = ?', (customer_id,))
+                    cursor.execute('DELETE FROM customers WHERE id = ?', (customer_id,))
+                    print(f"Auto-deleted customer: {display_name}")
+                    deleted_count += 1
+
+                conn.commit()
+                print(f"Auto-deleted {deleted_count} customers with zero balance")
+
+                # Refresh table if any were deleted
+                if deleted_count > 0:
+                    self.refresh_table()
+
+        except Exception as e:
+            conn.rollback()
+            print(f"Error in auto-delete: {e}")
+        finally:
+            conn.close()
+
+    def check_startup_reminders(self):
+        """Check for reminders at startup - adds ₱3 penalty monthly and shows popup if there are overdue debts"""
+        print("Checking for overdue accounts at startup...")
+        conn = self.get_db_connection()
+        overdue_customers = []
+        penalty_added = False
+
+        try:
+            cursor = conn.cursor()
+
+            # Calculate the date 30 days ago (but set to 1 day for testing)
+            thirty_days_ago = (datetime.now() - timedelta(days=30)).isoformat()
+            today = datetime.now().strftime("%Y-%m-%d")
+
+            # Find all customers with a balance > 0
+            cursor.execute("SELECT id, display_name, balance FROM customers WHERE balance > 0")
+            customers_with_balance = cursor.fetchall()
+
+            for customer_id, display_name, balance in customers_with_balance:
+                # For each customer, find the date of their oldest credit transaction
+                cursor.execute("""
+                    SELECT MIN(created_at) FROM transactions 
+                    WHERE customer_id = ? AND action = 'Credit Added'
+                """, (customer_id,))
+                result = cursor.fetchone()
+                oldest_credit_date_str = result[0] if result else None
+
+                # If they have a credit and it's older than 30 days (1 day for testing)
+                if oldest_credit_date_str and oldest_credit_date_str < thirty_days_ago:
+                    # MONTHLY PENALTY LOGIC: Check last penalty date
+                    cursor.execute("""
+                        SELECT MAX(date) FROM transactions 
+                        WHERE customer_id = ? AND action = 'Overdue Penalty'
+                    """, (customer_id,))
+                    last_penalty_result = cursor.fetchone()
+                    last_penalty_date = last_penalty_result[0] if last_penalty_result[0] else None
+
+                    # Add penalty if never penalized or last penalty was more than 30 days ago
+                    should_add_penalty = True
+                    penalty_status = "new monthly penalty"
+
+                    if last_penalty_date:
+                        try:
+                            last_penalty_datetime = datetime.strptime(last_penalty_date, "%Y-%m-%d")
+                            days_since_last_penalty = (datetime.now() - last_penalty_datetime).days
+                            should_add_penalty = days_since_last_penalty >= 30
+
+                            if not should_add_penalty:
+                                penalty_status = f"penalty added {days_since_last_penalty} days ago"
+                        except ValueError:
+                            # If date parsing fails, add penalty
+                            should_add_penalty = True
+                            penalty_status = "new monthly penalty"
+
+                    if should_add_penalty:
+                        # Add ₱3 penalty
+                        penalty_amount = 3.0
+                        new_balance = balance + penalty_amount
+
+                        # Update customer balance
+                        cursor.execute(
+                            'UPDATE customers SET balance = ?, updated_at = ?, sync_status = ? WHERE id = ?',
+                            (new_balance, datetime.now().isoformat(), 'pending', customer_id)
+                        )
+
+                        # Create penalty transaction
+                        transaction_id = str(uuid.uuid4())
+                        now = datetime.now().isoformat()
+                        cursor.execute(
+                            '''INSERT INTO transactions 
+                            (id, customer_id, date, time, action, product, quantity, amount, created_at, updated_at, sync_status) 
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                            (transaction_id, customer_id,
+                             today,
+                             datetime.now().strftime("%H:%M"),
+                             "Overdue Penalty", "Late Fee", 1, penalty_amount,
+                             now, now, 'pending')
+                        )
+
+                        overdue_customers.append((display_name, balance, new_balance, penalty_status))
+                        penalty_added = True
+                    else:
+                        # Penalty already added recently, but still show as overdue
+                        overdue_customers.append((display_name, balance, balance, penalty_status))
+
+            if penalty_added:
+                conn.commit()
+
+        except Exception as e:
+            conn.rollback()
+            print(f"Error checking for startup reminders: {e}")
+        finally:
+            conn.close()
+
+        # Refresh table to show updated balances
+        self.refresh_table()
+
+        # ONLY show popup at startup if there are overdue customers
+        if overdue_customers:
+            message = "Overdue Accounts:\n\n"
+            for name, old_balance, new_balance, status in overdue_customers:
+                if status == "new monthly penalty":
+                    message += f"- {name}: ₱{old_balance:.2f} → ₱{new_balance:.2f} (₱3 monthly penalty added)\n"
+                else:
+                    message += f"- {name}: ₱{new_balance:.2f} ({status})\n"
+            messagebox.showwarning("Overdue Accounts Reminder", message)
+        # No else clause - if no overdue debts, don't show any popup at startup
+
+    def check_for_reminders(self):
+        """Checks for borrowers with debts older than 30 days, adds ₱3 penalty monthly, and shows a reminder."""
+        print("Checking for overdue accounts...")
+        conn = self.get_db_connection()
+        overdue_customers = []
+        penalty_added = False
+
+        try:
+            cursor = conn.cursor()
+
+            # Calculate the date 30 days ago (but set to 1 day for testing)
+            thirty_days_ago = (datetime.now() - timedelta(days=30)).isoformat()  # TESTING: changed from 30 to 1
+            today = datetime.now().strftime("%Y-%m-%d")
+            print(f"DEBUG: Looking for transactions older than: {thirty_days_ago}")
+
+            # Find all customers with a balance > 0
+            cursor.execute("SELECT id, display_name, balance FROM customers WHERE balance > 0")
+            customers_with_balance = cursor.fetchall()
+            print(f"DEBUG: Found {len(customers_with_balance)} customers with balance > 0")
+
+            for customer_id, display_name, balance in customers_with_balance:
+                print(f"DEBUG: Checking customer: {display_name}, Balance: {balance}")
+
+                # For each customer, find the date of their oldest credit transaction
+                cursor.execute("""
+                    SELECT MIN(created_at) FROM transactions 
+                    WHERE customer_id = ? AND action = 'Credit Added'
+                """, (customer_id,))
+                result = cursor.fetchone()
+                oldest_credit_date_str = result[0] if result else None
+                print(f"DEBUG: {display_name} - Oldest credit date: {oldest_credit_date_str}")
+
+                # If they have a credit and it's older than 30 days (1 day for testing)
+                if oldest_credit_date_str and oldest_credit_date_str < thirty_days_ago:
+                    print(f"DEBUG: {display_name} - Account is overdue!")
+
+                    # MONTHLY PENALTY LOGIC: Check last penalty date
+                    cursor.execute("""
+                        SELECT MAX(date) FROM transactions 
+                        WHERE customer_id = ? AND action = 'Overdue Penalty'
+                    """, (customer_id,))
+                    last_penalty_result = cursor.fetchone()
+                    last_penalty_date = last_penalty_result[0] if last_penalty_result[0] else None
+
+                    # Add penalty if never penalized or last penalty was more than 30 days ago
+                    should_add_penalty = True
+                    penalty_status = "new monthly penalty"
+
+                    if last_penalty_date:
+                        try:
+                            last_penalty_datetime = datetime.strptime(last_penalty_date, "%Y-%m-%d")
+                            days_since_last_penalty = (datetime.now() - last_penalty_datetime).days
+                            should_add_penalty = days_since_last_penalty >= 30
+                            print(
+                                f"DEBUG: {display_name} - Days since last penalty: {days_since_last_penalty}, Should add penalty: {should_add_penalty}")
+
+                            if not should_add_penalty:
+                                penalty_status = f"penalty added {days_since_last_penalty} days ago"
+                        except ValueError as e:
+                            print(f"DEBUG: Error parsing date {last_penalty_date}: {e}")
+                            # If date parsing fails, add penalty
+                            should_add_penalty = True
+                            penalty_status = "new monthly penalty"
+
+                    if should_add_penalty:
+                        # Add ₱3 penalty
+                        penalty_amount = 3.0
+                        new_balance = balance + penalty_amount
+                        print(f"DEBUG: Adding ₱3 monthly penalty to {display_name}")
+
+                        # Update customer balance
+                        cursor.execute(
+                            'UPDATE customers SET balance = ?, updated_at = ?, sync_status = ? WHERE id = ?',
+                            (new_balance, datetime.now().isoformat(), 'pending', customer_id)
+                        )
+
+                        # Create penalty transaction
+                        transaction_id = str(uuid.uuid4())
+                        now = datetime.now().isoformat()
+                        cursor.execute(
+                            '''INSERT INTO transactions 
+                            (id, customer_id, date, time, action, product, quantity, amount, created_at, updated_at, sync_status) 
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                            (transaction_id, customer_id,
+                             today,
+                             datetime.now().strftime("%H:%M"),
+                             "Overdue Penalty", "Late Fee", 1, penalty_amount,
+                             now, now, 'pending')
+                        )
+
+                        overdue_customers.append((display_name, balance, new_balance, penalty_status))
+                        penalty_added = True
+                    else:
+                        # Penalty already added recently, but still show as overdue
+                        print(f"DEBUG: Monthly penalty already added recently for {display_name}")
+                        overdue_customers.append((display_name, balance, balance, penalty_status))
+                else:
+                    print(f"DEBUG: {display_name} - Account is NOT overdue")
+
+            if penalty_added:
+                conn.commit()
+                print("DEBUG: Monthly penalties committed to database")
+
+        except Exception as e:
+            conn.rollback()
+            print(f"Error checking for reminders: {e}")
+        finally:
+            conn.close()
+
+        # Refresh table to show updated balances
+        self.refresh_table()
+
+        print(f"DEBUG: Overdue customers found: {len(overdue_customers)}")
+
+        # If we found any overdue customers, show the pop-up
+        if overdue_customers:
+            message = "Overdue Accounts:\n\n"
+            for name, old_balance, new_balance, status in overdue_customers:
+                if status == "new monthly penalty":
+                    message += f"- {name}: ₱{old_balance:.2f} → ₱{new_balance:.2f} (₱3 monthly penalty added)\n"
+                else:
+                    message += f"- {name}: ₱{new_balance:.2f} ({status})\n"
+            print("DEBUG: Showing popup with overdue accounts")
+            messagebox.showwarning("Overdue Accounts Reminder", message)
+        else:
+            print("DEBUG: No overdue accounts found, showing 'no overdue' popup")
+            messagebox.showinfo("Reminders", "No overdue account found!")
+
+    def get_all_borrower_names(self):
+        """Get all unique borrower names for autocomplete"""
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT DISTINCT display_name FROM customers WHERE balance >= 0 ORDER BY display_name')
+        borrowers = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        return borrowers
 
     def toggle_search_mode(self):
         """Toggle between search mode and normal mode"""
@@ -252,15 +687,15 @@ class UtangTrackerApp:
                     else:
                         widget.config(state='normal')
             self.refresh_table()
-            self.entries["Account Name:"].focus()
+            self.entries["Borrower:"].focus()
 
     def clear_fields(self):
         """Clear all input fields including search"""
-        for entry in self.entries.values():
+        for label, entry in self.entries.items():
             if isinstance(entry, tk.Spinbox):
                 entry.delete(0, tk.END)
                 entry.insert(0, "0")
-            elif isinstance(entry, tk.Entry):
+            elif isinstance(entry, (tk.Entry, AutocompleteEntry)):
                 entry.delete(0, tk.END)
 
         # Clear search field regardless of mode
@@ -474,15 +909,15 @@ class UtangTrackerApp:
         return "N/A"
 
     def add_utang(self):
-        account_name = self.entries["Account Name:"].get().strip()
-        actual_borrower = self.entries["Actual Borrower:"].get().strip()
+        borrower_name = self.entries["Borrower:"].get().strip()
+        co_borrower = self.entries["Co-borrower:"].get().strip()
         product = self.entries["Product:"].get().strip()
         quantity = self.entries["Quantity:"].get()
         date = datetime.now().strftime("%Y-%m-%d")
         time = datetime.now().strftime("%H:%M")
 
-        if not account_name:
-            messagebox.showerror("Input Error", "Account name cannot be empty.")
+        if not borrower_name:
+            messagebox.showerror("Input Error", "Borrower name cannot be empty.")
             return
 
         try:
@@ -510,7 +945,7 @@ class UtangTrackerApp:
         cursor = conn.cursor()
 
         try:
-            customer_id, display_name = self.get_customer_id(account_name)
+            customer_id, display_name = self.get_customer_id(borrower_name)
 
             # Update customer balance
             cursor.execute(
@@ -518,7 +953,7 @@ class UtangTrackerApp:
                 (total_amount, datetime.now().isoformat(), 'pending', customer_id)
             )
 
-            # Create transaction with new schema
+            # Create transaction with new schema - CHANGED: "Add Credit" to "Credit Added"
             transaction_id = str(uuid.uuid4())
             now = datetime.now().isoformat()
             cursor.execute(
@@ -526,9 +961,9 @@ class UtangTrackerApp:
                 (id, customer_id, date, time, action, product, quantity, amount, actual_borrower, created_at, updated_at, sync_status) 
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (
-                    transaction_id, customer_id, date, time, "Add Credit",
+                    transaction_id, customer_id, date, time, "Credit Added",
                     product, quantity, total_amount,
-                    actual_borrower if actual_borrower and actual_borrower != display_name else None,
+                    co_borrower if co_borrower and co_borrower != display_name else None,
                     now, now, 'pending'
                 )
             )
@@ -536,6 +971,7 @@ class UtangTrackerApp:
             conn.commit()
             self.refresh_table()
             self.clear_fields()
+            self.auto_sync()
 
         except Exception as e:
             conn.rollback()
@@ -544,12 +980,12 @@ class UtangTrackerApp:
             conn.close()
 
     def record_payment(self):
-        account_name = self.entries["Account Name:"].get().strip()
+        borrower_name = self.entries["Borrower:"].get().strip()
         date = datetime.now().strftime("%Y-%m-%d")
         time = datetime.now().strftime("%H:%M")
 
-        if not account_name:
-            messagebox.showerror("Input Error", "Account name cannot be empty.")
+        if not borrower_name:
+            messagebox.showerror("Input Error", "Borrower name cannot be empty.")
             return
 
         try:
@@ -562,7 +998,7 @@ class UtangTrackerApp:
         cursor = conn.cursor()
 
         try:
-            cursor.execute('SELECT id, display_name, balance FROM customers WHERE name = ?', (account_name.lower(),))
+            cursor.execute('SELECT id, display_name, balance FROM customers WHERE name = ?', (borrower_name.lower(),))
             result = cursor.fetchone()
 
             if not result:
@@ -572,32 +1008,37 @@ class UtangTrackerApp:
             customer_id, display_name, balance = result
 
             new_balance = balance - amount
+
+            # Update customer balance with sync fields
+            now = datetime.now().isoformat()
             cursor.execute(
-                'UPDATE customers SET balance = ? WHERE id = ?',
-                (new_balance, customer_id)
+                'UPDATE customers SET balance = ?, updated_at = ?, sync_status = ? WHERE id = ?',
+                (new_balance, now, 'pending', customer_id)
             )
 
+            # Create transaction with UUID and sync fields - CHANGED: "Record Payment" to "Paid"
+            transaction_id = str(uuid.uuid4())
             cursor.execute(
                 '''INSERT INTO transactions 
-                (customer_id, date, time, action, product, quantity, amount) 
-                VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                (customer_id, date, time, "Record Payment", "N/A", 0, amount)
+                (id, customer_id, date, time, action, product, quantity, amount, created_at, updated_at, sync_status) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (transaction_id, customer_id, date, time, "Paid", "N/A", 0, amount, now, now, 'pending')
             )
 
             conn.commit()
             self.clear_fields()
 
-            if new_balance <= 0:
-                if messagebox.askyesno("Balance Cleared",
-                                       f"{display_name}'s balance is now ₱{new_balance:.2f}. Remove from list?"):
-                    cursor.execute('UPDATE customers SET balance = -1 WHERE id = ?', (customer_id,))
-                    conn.commit()
+            # REMOVED: No longer prompt to remove when balance reaches zero
+            # The customer will simply stay in the list with zero balance
 
             self.refresh_table()
+            self.auto_sync()
 
         except Exception as e:
             conn.rollback()
             messagebox.showerror("Database Error", f"An error occurred: {str(e)}")
+            import traceback
+            traceback.print_exc()  # This will print the full error to console
         finally:
             conn.close()
 
@@ -622,11 +1063,31 @@ class UtangTrackerApp:
 
             customers = cursor.fetchall()
 
+            # Calculate 30 days ago (PERMANENT)
+            thirty_days_ago = (datetime.now() - timedelta(days=30)).isoformat()
+
             for customer_id, display_name, balance in customers:
                 last_transaction = self.get_latest_transaction_datetime(customer_id)
+
+                # Check if overdue - only for customers with balance > 0
+                is_overdue = False
+                if balance > 0:
+                    cursor.execute("""
+                        SELECT MIN(created_at) FROM transactions 
+                        WHERE customer_id = ? AND action = 'Credit Added'
+                    """, (customer_id,))
+                    result = cursor.fetchone()
+                    oldest_credit_date_str = result[0] if result else None
+
+                    is_overdue = (oldest_credit_date_str and
+                                  oldest_credit_date_str < thirty_days_ago)
+
+                # Add warning emoji for overdue customers
+                display_name_with_indicator = display_name + " ⚠️" if is_overdue else display_name
+
                 self.tree.insert("", "end", values=(
                     last_transaction,
-                    display_name,
+                    display_name_with_indicator,
                     f"₱{balance:.2f}"
                 ))
 
@@ -703,11 +1164,11 @@ class UtangTrackerApp:
             info_frame = tk.Frame(history_window, bg=self.current_bg_color)
             info_frame.pack(fill=tk.X, padx=10, pady=5)
 
-            # Name frame
+            # Name frame - Updated label
             name_frame = tk.Frame(info_frame, bg=self.current_bg_color)
             name_frame.pack(side=tk.LEFT, pady=5)
 
-            tk.Label(name_frame, text="Account Name:",
+            tk.Label(name_frame, text="Borrower Name:",
                      font=("Arial", 12), bg=self.current_bg_color,
                      fg=self.current_fg_color).pack(side=tk.LEFT, padx=5)
 
@@ -722,7 +1183,7 @@ class UtangTrackerApp:
                 try:
                     new_name = name_var.get().strip()
                     if not new_name:
-                        messagebox.showerror("Error", "Customer name cannot be empty.")
+                        messagebox.showerror("Error", "Borrower name cannot be empty.")
                         return
 
                     conn = self.get_db_connection()
@@ -732,7 +1193,7 @@ class UtangTrackerApp:
                     conn.commit()
                     conn.close()
                     history_window.title(f"Transaction History for {new_name}")
-                    messagebox.showinfo("Updated", "Customer name updated successfully")
+                    messagebox.showinfo("Updated", "Borrower name updated successfully")
                     self.refresh_table()
                 except Exception as e:
                     messagebox.showerror("Error", f"Failed to update name: {str(e)}")
@@ -784,7 +1245,8 @@ class UtangTrackerApp:
             scrollbar = ttk.Scrollbar(tree_frame)
             scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-            history_columns = ("#", "Date & Time", "Action", "Product", "Quantity", "Amount", "Actual Borrower")
+            # Updated column name: Actual Borrower -> Co-borrower
+            history_columns = ("#", "Date & Time", "Action", "Product", "Quantity", "Amount", "Co-borrower")
             history_tree = ttk.Treeview(tree_frame, columns=history_columns, show="headings",
                                         yscrollcommand=scrollbar.set)
             history_tree.pack(fill=tk.BOTH, expand=True)
@@ -804,8 +1266,8 @@ class UtangTrackerApp:
             history_tree.column("Quantity", anchor="center", width=60)
             history_tree.heading("Amount", text="Amount")
             history_tree.column("Amount", anchor="center", width=100)
-            history_tree.heading("Actual Borrower", text="Actual Borrower")
-            history_tree.column("Actual Borrower", anchor="center", width=150)
+            history_tree.heading("Co-borrower", text="Co-borrower")
+            history_tree.column("Co-borrower", anchor="center", width=150)
 
             cursor.execute(
                 '''SELECT t.date, t.time, t.action, t.product, t.quantity, t.amount, t.actual_borrower 
@@ -816,13 +1278,12 @@ class UtangTrackerApp:
             )
             transactions = cursor.fetchall()
 
-            # In show_transaction_history method:
             for row_num, transaction in enumerate(transactions, 1):
                 date, time, action, product, quantity, amount, actual_borrower = transaction
 
                 # Calculate unit price for display purposes
                 unit_price = amount / quantity if quantity > 0 else amount
-                display_amount = amount if action == "Record Payment" else unit_price * quantity
+                display_amount = amount if action == "Paid" else unit_price * quantity
 
                 dt = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
                 formatted_datetime = dt.strftime("%Y-%m-%d %I:%M %p")
@@ -943,11 +1404,12 @@ class UtangTrackerApp:
             original_quantity = quantity
 
             # Calculate unit price for editing
-            if action == "Add Credit" and quantity > 0:
+            if action == "Credit Added" and quantity > 0:
                 amount_to_show = amount / quantity
             else:
                 amount_to_show = amount
 
+            # Updated label: Actual Borrower -> Co-borrower
             fields = {
                 "Date": date,
                 "Time": time,
@@ -955,7 +1417,7 @@ class UtangTrackerApp:
                 "Product": product,
                 "Quantity": quantity,
                 "Amount": amount_to_show,  # Show unit price for editing
-                "Actual Borrower": actual_borrower if actual_borrower else ""
+                "Co-borrower": actual_borrower if actual_borrower else ""
             }
 
             entries = {}
@@ -966,14 +1428,15 @@ class UtangTrackerApp:
                          bg=self.current_bg_color, fg=self.current_fg_color).grid(row=row, column=0, sticky="w", pady=5)
 
                 if label == "Action":
-                    entry = ttk.Combobox(form_frame, values=["Add Credit", "Record Payment"])
+                    # CHANGED HERE: Updated action values
+                    entry = ttk.Combobox(form_frame, values=["Credit Added", "Paid"])
                     entry.set(value)
                 elif label == "Quantity":
                     entry = tk.Spinbox(form_frame, from_=0, to=1000, width=10,
                                        bg=self.entry_bg, fg=self.entry_fg)
                     entry.delete(0, tk.END)
                     entry.insert(0, value)
-                elif label in ["Amount", "Time", "Actual Borrower"]:
+                elif label in ["Amount", "Time", "Co-borrower"]:
                     entry = tk.Entry(form_frame, width=15, bg=self.entry_bg, fg=self.entry_fg)
                     entry.insert(0, value)
                 else:
@@ -984,8 +1447,8 @@ class UtangTrackerApp:
                 entries[label] = entry
                 row += 1
 
-            # Add trace to update amount display when quantity changes for "Add Credit" transactions
-            if action == "Add Credit":
+            # Add trace to update amount display when quantity changes for "Credit Added" transactions
+            if action == "Credit Added":
                 def update_amount(*args):
                     try:
                         new_qty = int(entries["Quantity"].get())
@@ -1011,7 +1474,7 @@ class UtangTrackerApp:
                     updated_time = entries["Time"].get()
                     updated_action = entries["Action"].get()
                     updated_product = entries["Product"].get()
-                    updated_borrower = entries["Actual Borrower"].get()
+                    updated_borrower = entries["Co-borrower"].get()  # Updated field name
 
                     # Validate date and time formats
                     if not self.validate_date(updated_date):
@@ -1028,8 +1491,8 @@ class UtangTrackerApp:
                         messagebox.showerror("Input Error", "Quantity must be a number.")
                         return
 
-                    # For "Add Credit" transactions, multiply amount by quantity
-                    if updated_action == "Add Credit":
+                    # For "Credit Added" transactions, multiply amount by quantity
+                    if updated_action == "Credit Added":
                         try:
                             unit_price = float(entries["Amount"].get())
                             updated_amount = unit_price * updated_quantity
@@ -1045,13 +1508,13 @@ class UtangTrackerApp:
 
                     balance_adjustment = 0
 
-                    if original_action == "Add Credit":
-                        if updated_action == "Add Credit":
+                    if original_action == "Credit Added":
+                        if updated_action == "Credit Added":
                             balance_adjustment = updated_amount - original_amount
                         else:
                             balance_adjustment = -original_amount - updated_amount
                     else:
-                        if updated_action == "Record Payment":
+                        if updated_action == "Paid":
                             balance_adjustment = original_amount - updated_amount
                         else:
                             balance_adjustment = original_amount + updated_amount
@@ -1082,15 +1545,8 @@ class UtangTrackerApp:
 
                     conn.commit()
 
-                    if new_balance <= 0:
-                        if messagebox.askyesno("Balance Cleared",
-                                               f"{display_name}'s balance is now ₱{new_balance:.2f}. Remove from list?"):
-                            cursor.execute('UPDATE customers SET balance = 0 WHERE id = ?', (customer_id,))
-                            conn.commit()
-                            history_window.destroy()
-                            self.refresh_table()
-                            edit_window.destroy()
-                            return
+                    # REMOVED: No longer prompt to remove when balance reaches zero
+                    # The customer will simply stay in the list
 
                     self.refresh_transaction_history(history_window, customer_id)
                     self.refresh_table()
@@ -1162,7 +1618,11 @@ class UtangTrackerApp:
                                        f"Are you sure you want to delete this {action} transaction for ₱{amount:.2f}?"):
                 return
 
-            balance_adjustment = amount if action == "Record Payment" else -amount
+            # CHANGED HERE: Updated logic for new action names
+            if action == "Paid":
+                balance_adjustment = amount
+            else:
+                balance_adjustment = -amount
 
             cursor.execute(
                 'UPDATE customers SET balance = balance + ? WHERE id = ?',
@@ -1179,15 +1639,10 @@ class UtangTrackerApp:
 
             conn.commit()
 
-            if transaction_count == 0 or new_balance <= 0:
-                message = "No transactions left" if transaction_count == 0 else "Balance cleared"
-                if messagebox.askyesno("Customer Status", f"{message}. Remove {display_name} from list?"):
-                    cursor.execute('UPDATE customers SET balance = -1 WHERE id = ?', (customer_id,))
-                    conn.commit()
-                    history_window.destroy()
-            else:
-                self.refresh_transaction_history(history_window, customer_id)
+            # REMOVED: No longer prompt to remove when balance reaches zero or no transactions
+            # The customer will simply stay in the list
 
+            self.refresh_transaction_history(history_window, customer_id)
             self.refresh_table()
 
         except Exception as e:
@@ -1259,18 +1714,23 @@ class UtangTrackerApp:
         """Manual sync for desktop app"""
         try:
             from desktop_sync import desktop_sync
+            import tkinter.messagebox as messagebox
 
             if desktop_sync.is_connected():
-                import tkinter.messagebox as messagebox
                 messagebox.showinfo("Syncing", "Syncing desktop data with cloud...")
-                success = desktop_sync.sync_all_data()
+
+                # The sync function now returns a success flag and a message
+                success, message = desktop_sync.sync_all_data()
+
                 if success:
-                    messagebox.showinfo("Sync Complete", "Desktop data synchronized with cloud!")
+                    # Show the detailed summary message on success
+                    messagebox.showinfo("Sync Complete", message)
                     self.refresh_table()
                 else:
-                    messagebox.showerror("Sync Failed", "Failed to sync desktop data")
+                    # The sync function will show its own error popup,
+                    # but we can log it here if needed.
+                    print(f"Sync failed with message: {message}")
             else:
-                import tkinter.messagebox as messagebox
                 messagebox.showerror("Sync Error", "Firebase not configured for desktop app")
 
         except ImportError as e:
@@ -1278,8 +1738,36 @@ class UtangTrackerApp:
             messagebox.showerror("Sync Error", f"Desktop sync module not found: {e}")
         except Exception as e:
             import tkinter.messagebox as messagebox
-            messagebox.showerror("Sync Error", f"Sync failed: {str(e)}")
+            messagebox.showerror("Sync Error", f"An unexpected error occurred during sync: {str(e)}")
 
+    def auto_sync(self):
+        """Automatically sync data with the cloud and run maintenance tasks."""
+        print("Performing automatic background sync...")
+        try:
+            from desktop_sync import desktop_sync
+            if desktop_sync.is_connected():
+                success, message = desktop_sync.sync_all_data()
+                if success:
+                    print("Auto-sync successful. Refreshing table.")
+                    self.refresh_table()
+                    # Also refresh any open history windows
+                    for window in self.open_windows:
+                        if hasattr(window, 'customer_id'):
+                            self.refresh_transaction_history(window, window.customer_id)
+                else:
+                    print(f"Auto-sync failed: {message}")
+            else:
+                print("Firebase not connected, skipping auto-sync.")
+        except Exception as e:
+            print(f"An error occurred during auto-sync: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # Run auto-delete for zero balance customers
+        self.auto_delete_zero_balance()
+
+        # Schedule the next sync: 300000 milliseconds = 5 minutes
+        self.root.after(300000, self.auto_sync)
 
     def get_db_connection(self):
         """Get database connection for desktop app"""
@@ -1290,6 +1778,7 @@ class UtangTrackerApp:
 
         db_path = os.path.join(app_dir, 'data', 'utracker.db')
         return sqlite3.connect(db_path)
+
 
 if __name__ == "__main__":
     import sys
