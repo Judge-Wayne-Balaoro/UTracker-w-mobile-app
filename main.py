@@ -28,14 +28,12 @@ from kivymd.uix.dialog import MDDialog
 from kivymd.uix.button import MDFlatButton, MDRaisedButton
 from kivymd.uix.label import MDLabel
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import sqlite3
 import os
 import traceback
 import uuid
 
-
-from kivy.clock import Clock
 
 # --------------------------
 # UUID and timestamp helpers
@@ -83,7 +81,7 @@ def init_db():
         )
     ''')
 
-    # Transactions table with sync fields
+    # Transactions table with sync fields AND is_deleted flag
     c.execute('''
         CREATE TABLE IF NOT EXISTS transactions (
             id TEXT PRIMARY KEY,
@@ -99,100 +97,76 @@ def init_db():
             updated_at TEXT NOT NULL,
             sync_status TEXT DEFAULT 'pending',
             firebase_id TEXT,
+            is_deleted INTEGER DEFAULT 0,
             FOREIGN KEY (customer_id) REFERENCES customers (id)
         )
     ''')
 
     c.execute('CREATE INDEX IF NOT EXISTS idx_customer_name ON customers (name)')
 
-    # Create sync indexes separately to ensure tables exist first
     try:
         c.execute('CREATE INDEX IF NOT EXISTS idx_sync_status ON customers (sync_status)')
     except:
-        pass  # Index might fail if table doesn't exist yet, will be created in migration
+        pass
 
     try:
         c.execute('CREATE INDEX IF NOT EXISTS idx_tx_sync_status ON transactions (sync_status)')
     except:
-        pass  # Index might fail if table doesn't exist yet, will be created in migration
+        pass
 
     conn.commit()
     conn.close()
+
+
+def update_schema_if_needed():
+    """Adds the is_deleted column to the transactions table if it doesn't exist."""
+    conn = get_connection()
+    c = conn.cursor()
+    try:
+        c.execute("PRAGMA table_info(transactions)")
+        columns = [col[1] for col in c.fetchall()]
+        if 'is_deleted' not in columns:
+            print("Updating transactions schema to add 'is_deleted' column...")
+            c.execute("ALTER TABLE transactions ADD COLUMN is_deleted INTEGER DEFAULT 0")
+            conn.commit()
+            print("Schema updated successfully.")
+    except Exception as e:
+        print(f"Schema update failed: {e}")
+    finally:
+        conn.close()
 
 
 def migrate_database():
     """Migrate existing database to new schema"""
     conn = get_connection()
     c = conn.cursor()
-
-    # Check if migration is needed by looking for old integer ID column
     c.execute("PRAGMA table_info(customers)")
     columns = [col[1] for col in c.fetchall()]
-
-    # Check if this is the old schema (has integer ID)
     has_integer_id = any(
         col[1] == 'id' and col[2] == 'INTEGER' for col in c.execute("PRAGMA table_info(customers)").fetchall())
 
     if has_integer_id:
         print("Migrating database to new schema...")
-        # Backup old tables
         c.execute("ALTER TABLE customers RENAME TO customers_old")
         c.execute("ALTER TABLE transactions RENAME TO transactions_old")
-
-        # Re-create new tables with proper schema
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS customers (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                display_name TEXT NOT NULL,
-                phone_number TEXT,
-                balance REAL NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                sync_status TEXT DEFAULT 'pending',
-                firebase_id TEXT
-            )
-        ''')
-
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS transactions (
-                id TEXT PRIMARY KEY,
-                customer_id TEXT NOT NULL,
-                date TEXT NOT NULL,
-                time TEXT NOT NULL,
-                action TEXT NOT NULL,
-                product TEXT,
-                quantity INTEGER NOT NULL DEFAULT 0,
-                amount REAL NOT NULL,
-                actual_borrower TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                sync_status TEXT DEFAULT 'pending',
-                firebase_id TEXT,
-                FOREIGN KEY (customer_id) REFERENCES customers (id)
-            )
-        ''')
+        init_db()  # Re-create tables with the correct, modern schema
 
         # Migrate customers
         c.execute('SELECT id, name, display_name, phone_number, balance FROM customers_old')
         old_customers = c.fetchall()
-
         for old_id, name, display_name, phone_number, balance in old_customers:
             new_id = generate_id()
             now = get_current_timestamp()
-            c.execute('''INSERT INTO customers 
+            c.execute('''INSERT INTO customers
                         (id, name, display_name, phone_number, balance, created_at, updated_at, sync_status)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
                       (new_id, name, display_name, phone_number, balance, now, now, 'synced'))
-
-            # Update transactions with new customer ID
             c.execute('UPDATE transactions_old SET customer_id = ? WHERE customer_id = ?', (new_id, old_id))
 
         # Migrate transactions
         c.execute(
             'SELECT id, customer_id, date, time, action, product, quantity, amount, actual_borrower FROM transactions_old')
         old_transactions = c.fetchall()
-
         for old_id, customer_id, date, time, action, product, quantity, amount, actual_borrower in old_transactions:
             new_id = generate_id()
             now = get_current_timestamp()
@@ -201,16 +175,8 @@ def migrate_database():
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                       (new_id, customer_id, date, time, action, product, quantity, amount, actual_borrower, now, now,
                        'synced'))
-
-        # Create indexes after migration
-        c.execute('CREATE INDEX IF NOT EXISTS idx_customer_name ON customers (name)')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_sync_status ON customers (sync_status)')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_tx_sync_status ON transactions (sync_status)')
-
-        # Drop old tables
         c.execute("DROP TABLE customers_old")
         c.execute("DROP TABLE transactions_old")
-
         conn.commit()
         print("Database migrated successfully")
     else:
@@ -223,22 +189,22 @@ def get_connection():
     return sqlite3.connect(DB_PATH)
 
 
-# FIXED: Helper function to recalculate balance from scratch
 def recalculate_customer_balance(customer_id):
-    """Recalculate customer balance from all transactions"""
+    """Recalculate customer balance from non-deleted transactions"""
     conn = get_connection()
     c = conn.cursor()
-    c.execute('SELECT action, amount FROM transactions WHERE customer_id = ?', (customer_id,))
+    c.execute('SELECT action, amount FROM transactions WHERE customer_id = ? AND is_deleted = 0', (customer_id,))
     rows = c.fetchall()
 
     balance = 0
     for action, amount in rows:
         if action == "Add Credit":
             balance += amount
-        elif action == "Record Payment":
+        elif action == "Paid":  # Changed from "Record Payment" to "Paid"
             balance -= amount
+        elif action == "Overdue Penalty":
+            balance += amount  # Penalties increase the balance
 
-    # Update customer with timestamp
     now = get_current_timestamp()
     c.execute('UPDATE customers SET balance = ?, updated_at = ?, sync_status = ? WHERE id = ?',
               (balance, now, 'pending', customer_id))
@@ -247,15 +213,12 @@ def recalculate_customer_balance(customer_id):
     return balance
 
 
-# --------------------------
-# DB operations matching desktop logic
-# --------------------------
 def get_customers(search_term=None):
     conn = get_connection()
     c = conn.cursor()
     if search_term:
         like = f'%{search_term.lower()}%'
-        c.execute('''SELECT id, display_name, balance FROM customers 
+        c.execute('''SELECT id, display_name, balance FROM customers
                      WHERE (name LIKE ? OR display_name LIKE ?) AND balance >= 0 ORDER BY display_name''',
                   (like, like))
     else:
@@ -274,11 +237,10 @@ def get_customer_by_name_or_create(name):
         conn.close()
         return r[0], r[1]
 
-    # Create new customer with UUID and timestamps
     customer_id = generate_id()
     now = get_current_timestamp()
-    c.execute('''INSERT INTO customers 
-                (id, name, display_name, balance, created_at, updated_at, sync_status) 
+    c.execute('''INSERT INTO customers
+                (id, name, display_name, balance, created_at, updated_at, sync_status)
                 VALUES (?, ?, ?, 0, ?, ?, ?)''',
               (customer_id, name.lower(), name, now, now, 'pending'))
     conn.commit()
@@ -289,8 +251,9 @@ def get_customer_by_name_or_create(name):
 def get_latest_transaction_datetime(customer_id):
     conn = get_connection()
     c = conn.cursor()
-    c.execute('SELECT date, time FROM transactions WHERE customer_id = ? ORDER BY date DESC, time DESC LIMIT 1',
-              (customer_id,))
+    c.execute(
+        'SELECT date, time FROM transactions WHERE customer_id = ? AND is_deleted = 0 ORDER BY date DESC, time DESC LIMIT 1',
+        (customer_id,))
     r = c.fetchone()
     conn.close()
     if r:
@@ -302,9 +265,9 @@ def get_latest_transaction_datetime(customer_id):
     return "N/A"
 
 
-def add_credit_db(account_name, actual_borrower, product, quantity, unit_amount):
-    if not account_name:
-        raise ValueError("Account name cannot be empty.")
+def add_credit_db(borrower_name, co_borrower, product, quantity, unit_amount):
+    if not borrower_name:
+        raise ValueError("Borrower name cannot be empty.")
     if not product:
         raise ValueError("Product cannot be empty.")
     try:
@@ -323,30 +286,26 @@ def add_credit_db(account_name, actual_borrower, product, quantity, unit_amount)
 
     conn = get_connection()
     c = conn.cursor()
-    cid, display_name = get_customer_by_name_or_create(account_name)
+    cid, display_name = get_customer_by_name_or_create(borrower_name)
     now_date = datetime.now().strftime("%Y-%m-%d")
     now_time = datetime.now().strftime("%H:%M")
     now_iso = get_current_timestamp()
+    borrower_to_store = co_borrower if co_borrower and co_borrower != display_name else None
 
-    borrower_to_store = actual_borrower if actual_borrower and actual_borrower != display_name else None
-
-    # Generate transaction ID and add timestamps
     tx_id = generate_id()
-    c.execute('''INSERT INTO transactions 
-                 (id, customer_id, date, time, action, product, quantity, amount, actual_borrower, created_at, updated_at, sync_status) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-              (tx_id, cid, now_date, now_time, "Add Credit", product, quantity, total_amount,
+    c.execute('''INSERT INTO transactions
+                 (id, customer_id, date, time, action, product, quantity, amount, actual_borrower, created_at, updated_at, sync_status, is_deleted)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)''',
+              (tx_id, cid, now_date, now_time, "Credit Added", product, quantity, total_amount,
                borrower_to_store, now_iso, now_iso, 'pending'))
     conn.commit()
     conn.close()
-
-    # FIXED: Recalculate balance from scratch
     recalculate_customer_balance(cid)
 
 
-def record_payment_db(account_name, amount):
-    if not account_name:
-        raise ValueError("Account name cannot be empty.")
+def record_payment_db(borrower_name, amount):
+    if not borrower_name:
+        raise ValueError("Borrower name cannot be empty.")
     try:
         amount = float(amount)
         if amount < 0:
@@ -356,14 +315,12 @@ def record_payment_db(account_name, amount):
 
     conn = get_connection()
     c = conn.cursor()
-    c.execute('SELECT id, display_name, balance FROM customers WHERE name = ?', (account_name.lower(),))
+    c.execute('SELECT id, display_name, balance FROM customers WHERE name = ?', (borrower_name.lower(),))
     r = c.fetchone()
     if not r:
         conn.close()
         raise ValueError("Customer not found.")
     customer_id, display_name, current_balance = r
-
-    # Check if payment would result in negative balance
     if current_balance < amount:
         conn.close()
         raise ValueError(f"Payment amount (₱{amount:.2f}) exceeds current balance (₱{current_balance:.2f})")
@@ -371,16 +328,12 @@ def record_payment_db(account_name, amount):
     now_date = datetime.now().strftime("%Y-%m-%d")
     now_time = datetime.now().strftime("%H:%M")
     now_iso = get_current_timestamp()
-
-    # Generate transaction ID
     tx_id = generate_id()
-    c.execute('''INSERT INTO transactions (id, customer_id, date, time, action, product, quantity, amount, created_at, updated_at, sync_status) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-              (tx_id, customer_id, now_date, now_time, "Record Payment", "N/A", 0, amount, now_iso, now_iso, 'pending'))
+    c.execute('''INSERT INTO transactions (id, customer_id, date, time, action, product, quantity, amount, created_at, updated_at, sync_status, is_deleted)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)''',
+              (tx_id, customer_id, now_date, now_time, "Paid", "N/A", 0, amount, now_iso, now_iso, 'pending'))  # Changed to "Paid"
     conn.commit()
     conn.close()
-
-    # FIXED: Recalculate balance from scratch
     new_balance = recalculate_customer_balance(customer_id)
     return customer_id, display_name, new_balance
 
@@ -389,7 +342,7 @@ def get_transactions_db(customer_id):
     conn = get_connection()
     c = conn.cursor()
     c.execute('''SELECT id, date, time, action, product, quantity, amount, actual_borrower
-                 FROM transactions WHERE customer_id = ? ORDER BY datetime(date || ' ' || time) ASC''',
+                 FROM transactions WHERE customer_id = ? AND is_deleted = 0 ORDER BY datetime(date || ' ' || time) ASC''',
               (customer_id,))
     rows = c.fetchall()
     conn.close()
@@ -419,7 +372,6 @@ def get_customer_db(customer_id):
     return r
 
 
-# FIXED: Completely rewritten update_transaction_db function
 def update_transaction_db(transaction_id, updated_date, updated_time, updated_action,
                           updated_product, updated_quantity, updated_amount, updated_borrower):
     if updated_amount < 0:
@@ -433,8 +385,6 @@ def update_transaction_db(transaction_id, updated_date, updated_time, updated_ac
         conn.close()
         raise ValueError("Transaction not found.")
     customer_id = row[0]
-
-    # Update the transaction with timestamp
     now = get_current_timestamp()
     c.execute('''UPDATE transactions SET date=?, time=?, action=?, product=?, quantity=?, amount=?, actual_borrower=?, updated_at=?, sync_status=?
                  WHERE id=?''',
@@ -442,17 +392,14 @@ def update_transaction_db(transaction_id, updated_date, updated_time, updated_ac
                updated_borrower if updated_borrower else None, now, 'pending', transaction_id))
     conn.commit()
     conn.close()
-
-    # FIXED: Recalculate balance from scratch instead of trying to adjust
     new_balance = recalculate_customer_balance(customer_id)
     return customer_id, new_balance
 
 
 def delete_transaction_db(transaction_id):
+    """Soft deletes a transaction by marking it as deleted."""
     conn = get_connection()
     c = conn.cursor()
-
-    # Find the customer linked to this transaction
     c.execute('SELECT customer_id, action, amount FROM transactions WHERE id = ?', (transaction_id,))
     row = c.fetchone()
     if not row:
@@ -460,18 +407,20 @@ def delete_transaction_db(transaction_id):
         raise ValueError("Transaction not found.")
     customer_id, action, amount = row
 
-    # Delete the transaction
-    c.execute('DELETE FROM transactions WHERE id = ?', (transaction_id,))
-
-    # Count remaining transactions
-    c.execute('SELECT COUNT(*) FROM transactions WHERE customer_id = ?', (customer_id,))
-    tx_count = c.fetchone()[0]
-
+    now = get_current_timestamp()
+    c.execute('''
+        UPDATE transactions
+        SET is_deleted = 1, updated_at = ?, sync_status = 'pending'
+        WHERE id = ?
+    ''', (now, transaction_id))
     conn.commit()
     conn.close()
 
-    # FIXED: Recalculate balance from scratch
     new_balance = recalculate_customer_balance(customer_id)
+    c = get_connection().cursor()
+    c.execute('SELECT COUNT(*) FROM transactions WHERE customer_id = ? AND is_deleted = 0', (customer_id,))
+    tx_count = c.fetchone()[0]
+    c.connection.close()
     return customer_id, tx_count, new_balance, action, amount
 
 
@@ -485,9 +434,112 @@ def mark_customer_removed_db(customer_id):
     conn.close()
 
 
-# --------------------------
-# UI helper popups (Kivy Popup for complex forms; MDDialog for simple messages)
-# --------------------------
+def check_for_overdue_accounts():
+    """Check for overdue accounts and add penalties - returns list of overdue customers"""
+    conn = get_connection()
+    c = conn.cursor()
+    overdue_customers = []
+    penalty_added = False
+
+    try:
+        thirty_days_ago = (datetime.now() - timedelta(days=30)).isoformat()
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        # Find all customers with a balance > 0
+        c.execute("SELECT id, display_name, balance FROM customers WHERE balance > 0")
+        customers_with_balance = c.fetchall()
+
+        for customer_id, display_name, balance in customers_with_balance:
+            # For each customer, find the date of their oldest credit transaction
+            c.execute("""
+                SELECT MIN(created_at) FROM transactions 
+                WHERE customer_id = ? AND action = 'Add Credit' AND is_deleted = 0
+            """, (customer_id,))
+            result = c.fetchone()
+            oldest_credit_date_str = result[0] if result else None
+
+            # If they have a credit and it's older than 2 hours (for testing)
+            if oldest_credit_date_str and oldest_credit_date_str < thirty_days_ago:
+                # Check last penalty date
+                c.execute("""
+                    SELECT MAX(date) FROM transactions 
+                    WHERE customer_id = ? AND action = 'Overdue Penalty' AND is_deleted = 0
+                """, (customer_id,))
+                last_penalty_result = c.fetchone()
+                last_penalty_date = last_penalty_result[0] if last_penalty_result[0] else None
+
+                # Add penalty if never penalized or last penalty was more than 30 days ago
+                should_add_penalty = True
+                penalty_status = "NEW PENALTY"
+
+                if last_penalty_date:
+                    try:
+                        last_penalty_datetime = datetime.strptime(last_penalty_date, "%Y-%m-%d")
+                        days_since_last_penalty = (datetime.now() - last_penalty_datetime).days
+                        should_add_penalty = days_since_last_penalty >= 30
+
+                        if not should_add_penalty:
+                            penalty_status = f"Last penalty {days_since_last_penalty} days ago"
+                    except ValueError:
+                        should_add_penalty = True
+                        penalty_status = "NEW PENALTY"
+
+                if should_add_penalty:
+                    # Add ₱3 penalty
+                    penalty_amount = 3.0
+                    new_balance = balance + penalty_amount
+
+                    # Update customer balance
+                    c.execute(
+                        'UPDATE customers SET balance = ?, updated_at = ?, sync_status = ? WHERE id = ?',
+                        (new_balance, datetime.now().isoformat(), 'pending', customer_id)
+                    )
+
+                    # Create penalty transaction
+                    transaction_id = generate_id()
+                    now = get_current_timestamp()
+                    c.execute(
+                        '''INSERT INTO transactions 
+                        (id, customer_id, date, time, action, product, quantity, amount, created_at, updated_at, sync_status, is_deleted) 
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)''',
+                        (transaction_id, customer_id,
+                         today,
+                         datetime.now().strftime("%H:%M"),
+                         "Overdue Penalty", "Late Fee", 1, penalty_amount,
+                         now, now, 'pending')
+                    )
+
+                    overdue_customers.append({
+                        'name': display_name,
+                        'old_balance': balance,
+                        'new_balance': new_balance,
+                        'status': penalty_status,
+                        'penalty_added': True
+                    })
+                    penalty_added = True
+                else:
+                    # Penalty already added recently, but still show as overdue
+                    overdue_customers.append({
+                        'name': display_name,
+                        'old_balance': balance,
+                        'new_balance': balance,
+                        'status': penalty_status,
+                        'penalty_added': False
+                    })
+
+        if penalty_added:
+            conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        print(f"Error checking for overdue accounts: {e}")
+        traceback.print_exc()
+    finally:
+        conn.close()
+
+    return overdue_customers
+
+
 def show_message(title, message):
     dlg = MDDialog(title=title, text=message, buttons=[MDFlatButton(text="OK", on_release=lambda x: dlg.dismiss())])
     dlg.open()
@@ -513,9 +565,6 @@ def confirm_action(title, message, on_confirm):
     popup.open()
 
 
-# --------------------------
-# UI components (cards / rows)
-# --------------------------
 class CustomerCard(MDCard):
     def __init__(self, cid, name, balance, last_tx, open_history_cb, **kwargs):
         super().__init__(**kwargs)
@@ -527,12 +576,15 @@ class CustomerCard(MDCard):
         self.customer_id = cid
         self.elevation = 2
 
-        # Create main content with proper size hints
-        main_content = BoxLayout(orientation='vertical', spacing=dp(4))
+        # Check if customer is overdue
+        is_overdue = self.check_if_overdue(cid, balance)
 
-        # Top row: name and balance
+        main_content = BoxLayout(orientation='vertical', spacing=dp(4))
         top = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(24))
-        name_label = MDLabel(text=f"[b]{name}[/b]", markup=True, size_hint_x=0.7)
+
+        # Add warning emoji for overdue customers
+        display_name = f"{name}" if is_overdue else name
+        name_label = MDLabel(text=f"[b]{display_name}[/b]", markup=True, size_hint_x=0.7)
         name_label.theme_text_color = "Primary"
         top.add_widget(name_label)
 
@@ -541,18 +593,39 @@ class CustomerCard(MDCard):
         top.add_widget(balance_label)
         main_content.add_widget(top)
 
-        # Bottom row: last transaction + open button
         bottom = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(36), spacing=dp(8))
         last_tx_label = MDLabel(text=f"{last_tx}", theme_text_color='Hint', size_hint_x=0.65)
         bottom.add_widget(last_tx_label)
-
-        # Use regular Button instead of MDRaisedButton to avoid layout issues
         open_btn = Button(text='Open', size_hint=(None, None), size=(dp(70), dp(32)))
         open_btn.bind(on_release=lambda *_: open_history_cb(cid))
         bottom.add_widget(open_btn)
         main_content.add_widget(bottom)
-
         self.add_widget(main_content)
+
+    def check_if_overdue(self, customer_id, balance):
+        """Check if customer is overdue (balance > 0 and oldest credit > 2 hours)"""
+        if balance <= 0:
+            return False
+
+        conn = get_connection()
+        c = conn.cursor()
+        try:
+            # Calculate 2 hours ago (for testing - same as desktop)
+            thirty_days_ago = (datetime.now() - timedelta(days=30)).isoformat()
+
+            c.execute("""
+                SELECT MIN(created_at) FROM transactions 
+                WHERE customer_id = ? AND action = 'Add Credit'
+            """, (customer_id,))
+            result = c.fetchone()
+            oldest_credit_date_str = result[0] if result else None
+
+            return oldest_credit_date_str and oldest_credit_date_str < thirty_days_ago
+        except Exception as e:
+            print(f"Error checking overdue status: {e}")
+            return False
+        finally:
+            conn.close()
 
 
 class TransactionRow(BoxLayout):
@@ -560,33 +633,26 @@ class TransactionRow(BoxLayout):
         super().__init__(orientation='horizontal', size_hint_y=None, height=dp(70), spacing=dp(8), **kwargs)
         self.tx = tx
         tx_id, date, time, action, product, quantity, amount, actual_borrower = tx
-
-        # Left side - transaction info
         left = BoxLayout(orientation='vertical', size_hint_x=0.6, spacing=dp(2))
         date_label = MDLabel(text=f"{date} {time}", theme_text_color='Hint', font_style='Caption')
         date_label.size_hint_y = None
         date_label.height = dp(20)
         left.add_widget(date_label)
-
         desc = f"{action} • {product}"
-        borrower_display = actual_borrower if actual_borrower else ""
-        if borrower_display:
-            desc += f" • {borrower_display}"
+        co_borrower_display = actual_borrower if actual_borrower else ""
+        if co_borrower_display:
+            desc += f" • {co_borrower_display}"
         desc_label = MDLabel(text=desc, font_style='Body2')
         desc_label.size_hint_y = None
         desc_label.height = dp(24)
         left.add_widget(desc_label)
         self.add_widget(left)
-
-        # Right side - amount and buttons
         right = BoxLayout(orientation='vertical', size_hint_x=0.4, spacing=dp(4))
         amount_color = 'Primary' if amount >= 0 else 'Error'
         amount_label = MDLabel(text=f"₱{amount:.2f}", halign='right', theme_text_color=amount_color)
         amount_label.size_hint_y = None
         amount_label.height = dp(24)
         right.add_widget(amount_label)
-
-        # Use regular buttons to avoid layout loops
         btns = BoxLayout(size_hint_y=None, height=dp(32), spacing=dp(4))
         edit = Button(text='Edit', size_hint_x=0.5)
         delete = Button(text='Delete', size_hint_x=0.5)
@@ -594,14 +660,10 @@ class TransactionRow(BoxLayout):
         btns.add_widget(delete)
         right.add_widget(btns)
         self.add_widget(right)
-
         edit.bind(on_release=lambda *_: edit_cb(tx_id))
         delete.bind(on_release=lambda *_: delete_cb(tx_id))
 
 
-# --------------------------
-# Screens
-# --------------------------
 KV = """
 <MainScreenManager>:
     LoginScreen:
@@ -651,8 +713,8 @@ KV = """
         MDToolbar:
             title: 'UTracker'
             elevation: 10
-            right_action_items: [['cloud-sync', lambda x: app.manual_sync()]]
-        
+            right_action_items: [['cloud-sync', lambda x: app.manual_sync()], ['alert', lambda x: app.check_reminders()]]
+
         BoxLayout:
             size_hint_y: None
             height: dp(56)
@@ -681,15 +743,15 @@ KV = """
             height: dp(300)
 
             TextInput:
-                id: account_name
-                hint_text: 'Account Name'
+                id: borrower_name
+                hint_text: 'Borrower'
                 multiline: False
                 size_hint_y: None
                 height: dp(44)
 
             TextInput:
-                id: actual_borrower
-                hint_text: 'Actual Borrower (optional)'
+                id: co_borrower
+                hint_text: 'Co-borrower'
                 multiline: False
                 size_hint_y: None
                 height: dp(44)
@@ -751,7 +813,7 @@ KV = """
             TextInput:
                 id: cust_name_input
                 multiline: False
-                hint_text: 'Account Name'
+                hint_text: 'Borrower Name'
             Button:
                 text: 'Update Name'
                 size_hint_x: None
@@ -808,30 +870,28 @@ class HistoryScreen(MDScreen):
     pass
 
 
-# --------------------------
-# App
-# --------------------------
 class UTrackerApp(MDApp):
     def build(self):
         init_db()
-        migrate_database()  # Add migration here
-        Window.clearcolor = (1, 0.973, 0.863, 1)  # soft cream
+        update_schema_if_needed()
+        migrate_database()
+        Window.clearcolor = (1, 0.973, 0.863, 1)
         self.theme_cls.theme_style = "Light"
         self.theme_cls.primary_palette = "Amber"
         Builder.load_string(KV)
         self.sm = MainScreenManager()
-        self.current_customer_id = None  # used by history screen
+        self.current_customer_id = None
         return self.sm
 
-    # ---------- Login ----------
     def do_login(self, username, password):
         if username.strip() == 'admin' and password.strip() == 'admin':
             self.sm.current = 'dashboard'
             self.load_customers()
+            # Check for overdue accounts on startup
+            Clock.schedule_once(lambda dt: self.check_startup_reminders(), 2)
         else:
             show_message("Login Failed", "Invalid username or password")
 
-    # ---------- Dashboard helpers ----------
     def load_customers(self, search_text=""):
         try:
             screen = self.sm.get_screen('dashboard')
@@ -852,8 +912,8 @@ class UTrackerApp(MDApp):
 
     def clear_form(self):
         screen = self.sm.get_screen('dashboard')
-        screen.ids.account_name.text = ''
-        screen.ids.actual_borrower.text = ''
+        screen.ids.borrower_name.text = ''
+        screen.ids.co_borrower.text = ''
         screen.ids.product.text = ''
         screen.ids.quantity.text = '1'
         screen.ids.amount.text = ''
@@ -861,43 +921,36 @@ class UTrackerApp(MDApp):
 
     def handle_add_credit(self):
         screen = self.sm.get_screen('dashboard')
-        account = screen.ids.account_name.text.strip()
-        borrower = screen.ids.actual_borrower.text.strip()
+        borrower = screen.ids.borrower_name.text.strip()
+        co_borrower = screen.ids.co_borrower.text.strip()
         product = screen.ids.product.text.strip()
         quantity = screen.ids.quantity.text.strip()
         amount = screen.ids.amount.text.strip()
         try:
-            add_credit_db(account, borrower, product, quantity, amount)
+            add_credit_db(borrower, co_borrower, product, quantity, amount)
             show_message("Success", "Credit added.")
             self.clear_form()
             self.load_customers()
+            self.trigger_background_sync()
         except Exception as e:
             traceback.print_exc()
             show_message("Error", str(e))
 
     def handle_record_payment(self):
         screen = self.sm.get_screen('dashboard')
-        account = screen.ids.account_name.text.strip()
+        borrower = screen.ids.borrower_name.text.strip()
         amount = screen.ids.amount.text.strip()
         try:
-            cid, name, new_bal = record_payment_db(account, amount)
+            cid, name, new_bal = record_payment_db(borrower, amount)
             show_message("Payment Recorded", f"{name}'s new balance: ₱{new_bal:.2f}")
             self.clear_form()
             self.load_customers()
-            if new_bal <= 0:
-                def do_remove():
-                    mark_customer_removed_db(cid)
-                    self.load_customers()
-
-                confirm_action("Balance Cleared", f"{name}'s balance is now ₱{new_bal:.2f}. Remove from list?",
-                               do_remove)
+            self.trigger_background_sync()
         except Exception as e:
             traceback.print_exc()
             show_message("Error", str(e))
 
-    # ---------- History screen ----------
     def open_history(self, customer_id):
-        # open history screen and populate
         self.current_customer_id = customer_id
         data = get_customer_db(customer_id)
         if not data:
@@ -908,289 +961,130 @@ class UTrackerApp(MDApp):
         screen.ids.history_toolbar.title = f"History — {display_name} (₱{balance:.2f})"
         screen.ids.cust_name_input.text = display_name
         screen.ids.cust_phone_input.text = phone if phone else ''
-        # load transactions list
-        self.refresh_transactions()
+        self.load_transactions()
         self.sm.current = 'history'
 
-    def refresh_transactions(self):
+    def load_transactions(self):
         screen = self.sm.get_screen('history')
         grid = screen.ids.tx_grid
         grid.clear_widgets()
+        if not self.current_customer_id:
+            return
+        rows = get_transactions_db(self.current_customer_id)
+        if not rows:
+            lbl = MDLabel(text='(no transactions)', halign='center')
+            grid.add_widget(lbl)
+            return
+        for tx in rows:
+            row = TransactionRow(tx, self.edit_transaction, self.delete_transaction)
+            grid.add_widget(row)
+
+    def edit_transaction(self, tx_id):
+        pass  # Edit functionality for mobile can be added later
+
+    def delete_transaction(self, tx_id):
+        confirm_action("Delete Transaction", "Are you sure?", lambda: self.do_delete_transaction(tx_id))
+
+    def do_delete_transaction(self, tx_id):
         try:
-            txs = get_transactions_db(self.current_customer_id)
-            if not txs:
-                grid.add_widget(MDLabel(text="(no transactions)", halign='center'))
-                return
-            for tx in txs:
-                # tx tuple: id, date, time, action, product, quantity, amount, actual_borrower
-                row = TransactionRow(tx, edit_cb=self.open_edit_transaction_popup,
-                                     delete_cb=self.confirm_delete_transaction)
-                grid.add_widget(row)
+            cid, tx_count, new_bal, action, amount = delete_transaction_db(tx_id)
+            show_message("Deleted", f"Deleted {action} of ₱{amount:.2f}. New balance: ₱{new_bal:.2f}")
+            self.load_transactions()
+            self.trigger_background_sync()
+            if tx_count == 0:
+                self.go_back_to_dashboard()
+                self.load_customers()
         except Exception as e:
             traceback.print_exc()
             show_message("Error", str(e))
 
-    def go_back_to_dashboard(self):
-        self.current_customer_id = None
-        self.sm.current = 'dashboard'
-        self.load_customers()
-
-    # ---------- Update name / phone ----------
     def update_customer_name(self):
+        if not self.current_customer_id:
+            return
         screen = self.sm.get_screen('history')
         new_name = screen.ids.cust_name_input.text.strip()
         if not new_name:
-            show_message("Error", "Customer name cannot be empty.")
+            show_message("Error", "Name cannot be empty.")
             return
         try:
             update_customer_name_phone_db(self.current_customer_id, new_name=new_name)
             show_message("Updated", "Customer name updated.")
-            # refresh
-            self.open_history(self.current_customer_id)
+            self.load_transactions()
+            self.trigger_background_sync()
+            self.go_back_to_dashboard()
             self.load_customers()
         except Exception as e:
             traceback.print_exc()
             show_message("Error", str(e))
 
     def update_customer_phone(self):
+        if not self.current_customer_id:
+            return
         screen = self.sm.get_screen('history')
         new_phone = screen.ids.cust_phone_input.text.strip()
         try:
             update_customer_name_phone_db(self.current_customer_id, new_phone=new_phone)
-            show_message("Updated", "Phone number updated.")
-            self.open_history(self.current_customer_id)
+            show_message("Updated", "Customer phone updated.")
+            self.trigger_background_sync()
         except Exception as e:
             traceback.print_exc()
             show_message("Error", str(e))
 
-    # ---------- Edit transaction ----------
-    def open_edit_transaction_popup(self, tx_id):
-        # fetch transaction
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute(
-            'SELECT id, customer_id, date, time, action, product, quantity, amount, actual_borrower '
-            'FROM transactions WHERE id = ?', (tx_id,))
-        r = c.fetchone()
-        conn.close()
-        if not r:
-            show_message("Error", "Transaction not found.")
-            return
+    def go_back_to_dashboard(self):
+        self.sm.current = 'dashboard'
+        self.current_customer_id = None
+        self.load_customers()
 
-        (tid, cid, date, time, action, product, quantity, amount, actual_borrower) = r
-
-        # Build popup content
-        content = BoxLayout(orientation='vertical', spacing=8, padding=8)
-
-        # Date & Time
-        dt_row = BoxLayout(orientation='horizontal', spacing=8, size_hint_y=None, height=dp(40))
-        date_input = TextInput(text=date, multiline=False)
-        time_input = TextInput(text=time, multiline=False)
-        dt_row.add_widget(date_input)
-        dt_row.add_widget(time_input)
-        content.add_widget(Label(text="Date (YYYY-MM-DD) and Time (HH:MM)"))
-        content.add_widget(dt_row)
-
-        # Action dropdown (Spinner)
-        content.add_widget(Label(text="Action"))
-        action_spinner = Spinner(
-            text=action,
-            values=("Add Credit", "Record Payment"),
-            size_hint=(1, None),
-            height=dp(40)
-        )
-        content.add_widget(action_spinner)
-
-        # Product
-        content.add_widget(Label(text="Product"))
-        product_input = TextInput(text=product if product else '', multiline=False)
-        content.add_widget(product_input)
-
-        # Quantity
-        content.add_widget(Label(text="Quantity"))
-        quantity_input = TextInput(text=str(quantity), multiline=False, input_filter='int')
-        content.add_widget(quantity_input)
-
-        # Amount (always show what's stored in DB)
-        amount_input = TextInput(text=str(amount), multiline=False, input_filter='float')
-        content.add_widget(Label(text="Amount"))
-        content.add_widget(amount_input)
-
-        # Borrower
-        content.add_widget(Label(text="Actual Borrower (optional)"))
-        borrower_input = TextInput(text=actual_borrower if actual_borrower else '', multiline=False)
-        content.add_widget(borrower_input)
-
-        # Buttons
-        btns = BoxLayout(size_hint_y=None, height=dp(48), spacing=8)
-        save_btn = Button(text="Save")
-        cancel_btn = Button(text="Cancel")
-        btns.add_widget(save_btn)
-        btns.add_widget(cancel_btn)
-        content.add_widget(btns)
-
-        popup = Popup(title="Edit Transaction", content=content, size_hint=(0.95, 0.9))
-        cancel_btn.bind(on_release=popup.dismiss)
-
-        def do_save(*_):
-            ds = date_input.text.strip()
-            ts = time_input.text.strip()
-
-            # validate date/time
-            try:
-                datetime.strptime(ds, "%Y-%m-%d")
-            except:
-                show_message("Input Error", "Invalid date format. Use YYYY-MM-DD.")
-                return
-            try:
-                datetime.strptime(ts, "%H:%M")
-            except:
-                show_message("Input Error", "Invalid time format. Use HH:MM.")
-                return
-
-            up_action = action_spinner.text.strip()
-            up_product = product_input.text.strip()
-
-            try:
-                up_qty = int(quantity_input.text.strip())
-                if up_qty < 0:
-                    show_message("Input Error", "Quantity cannot be negative.")
-                    return
-            except:
-                show_message("Input Error", "Quantity must be a number.")
-                return
-
-            try:
-                if up_action == "Add Credit":
-                    unit = float(amount_input.text.strip())
-                    if unit < 0:
-                        show_message("Input Error", "Amount cannot be negative.")
-                        return
-                    up_amount = unit * up_qty
-                else:
-                    up_amount = float(amount_input.text.strip())
-                    if up_amount < 0:
-                        show_message("Input Error", "Amount cannot be negative.")
-                        return
-            except:
-                show_message("Input Error", "Amount must be a number.")
-                return
-
-            up_borrower = borrower_input.text.strip() if borrower_input.text.strip() else None
-
-            # FIXED: Additional validation for payment amounts
-            if up_action == "Record Payment":
-                # Get current customer balance and check if this edit would cause issues
-                conn = get_connection()
-                c = conn.cursor()
-                c.execute('SELECT balance FROM customers WHERE id = ?', (cid,))
-                current_balance = c.fetchone()[0]
-                conn.close()
-
-                # Calculate what balance would be after removing original transaction
-                if action == "Add Credit":
-                    temp_balance = current_balance - amount  # Remove the credit
-                elif action == "Record Payment":
-                    temp_balance = current_balance + amount  # Add back the payment
-                else:
-                    temp_balance = current_balance
-
-                # Check if new payment would cause negative balance
-                if temp_balance < up_amount:
-                    show_message("Input Error",
-                                 f"Payment amount (₱{up_amount:.2f}) would exceed available balance (₱{temp_balance:.2f})")
-                    return
-
-            try:
-                customer_id, new_balance = update_transaction_db(
-                    tid, ds, ts, up_action, up_product, up_qty, up_amount, up_borrower)
-                popup.dismiss()
-                show_message("Saved", f"Transaction updated. New balance: ₱{new_balance:.2f}")
-                # refresh UI
-                self.load_customers()
-                if self.current_customer_id == customer_id:
-                    self.open_history(customer_id)
-            except Exception as e:
-                traceback.print_exc()
-                show_message("Error", str(e))
-
-        save_btn.bind(on_release=do_save)
-        popup.open()
-
-    # ---------- Delete transaction ----------
-    def confirm_delete_transaction(self, tx_id):
-        def do_delete():
-            try:
-                customer_id, tx_count, new_balance, action, amount = delete_transaction_db(tx_id)
-                show_message("Deleted",
-                             f"Deleted {action} transaction for ₱{amount:.2f}. New balance: ₱{new_balance:.2f}")
-                if tx_count == 0 or new_balance <= 0:
-                    def do_remove():
-                        mark_customer_removed_db(customer_id)
-                        self.load_customers()
-                        if self.sm.current == 'history':
-                            self.sm.current = 'dashboard'
-
-                    msg = "No transactions left." if tx_count == 0 else "Balance cleared."
-                    confirm_action("Customer Status", f"{msg} Remove customer from list?", do_remove)
-                self.load_customers()
-                if self.current_customer_id == customer_id:
-                    self.open_history(customer_id)
-            except Exception as e:
-                traceback.print_exc()
-                show_message("Error", str(e))
-
-        confirm_action("Confirm Deletion", "Are you sure you want to delete this transaction?", do_delete)
-
-    def on_start(self):
-        """Called when app starts - add this method"""
-        # Schedule periodic sync every 5 minutes
-        Clock.schedule_interval(self.auto_sync, 300)  # 300 seconds = 5 minutes
-
-        # Initial sync after 3 seconds (let app load first)
-        Clock.schedule_once(lambda dt: self.auto_sync(), 3)
-
-    def auto_sync(self, dt=None):
-        """Automatically sync data - add this method"""
-        try:
-            from sync_service import sync_service
-            if sync_service.is_connected():
-                print("Auto-syncing data...")
-                success = sync_service.sync_all_data()
-                if success:
-                    print("Auto-sync completed")
-                    # Optional: Show brief notification
-                    # self.show_sync_notification("Synced with cloud")
-                else:
-                    print("Auto-sync failed")
-            else:
-                print("Firebase not connected - skipping auto-sync")
-        except Exception as e:
-            print(f"Auto-sync error: {e}")
+    def trigger_background_sync(self):
+        pass  # Background sync functionality for mobile
 
     def manual_sync(self):
-        """Manual sync triggered by user - add this method"""
-        try:
-            from sync_service import sync_service
-            if sync_service.is_connected():
-                show_message("Syncing", "Syncing data with cloud...")
-                success = sync_service.sync_all_data()
-                if success:
-                    show_message("Sync Complete", "Data synchronized successfully!")
-                    # Refresh the display
-                    self.load_customers()
+        show_message("Sync", "Manual sync triggered (mobile sync not implemented)")
+
+    def check_startup_reminders(self):
+        """Check for overdue accounts on startup"""
+        overdue_customers = check_for_overdue_accounts()
+        if overdue_customers:
+            message = "Overdue accounts found:\n\n"
+            for customer in overdue_customers:
+                name = customer['name']
+                old_balance = customer['old_balance']
+                new_balance = customer['new_balance']
+                status = customer['status']
+                penalty_added = customer['penalty_added']
+
+                if penalty_added:
+                    message += f"{name}: ₱{old_balance:.2f} → ₱{new_balance:.2f} ({status})\n"
                 else:
-                    show_message("Sync Failed", "Failed to sync data")
-            else:
-                show_message("Sync Error", "Firebase not configured")
-        except Exception as e:
-            show_message("Sync Error", f"Sync failed: {str(e)}")
+                    message += f"{name}: ₱{old_balance:.2f} ({status})\n"
 
+            # Refresh the customer list to show updated balances
+            self.load_customers()
+            show_message("Overdue Accounts", message)
 
-    def show_sync_notification(self, message):
-        """Show a brief sync status notification"""
-        from kivymd.uix.snackbar import Snackbar
-        Snackbar(text=message).open()
+    def check_reminders(self):
+        """Manual check for overdue accounts"""
+        overdue_customers = check_for_overdue_accounts()
+        if overdue_customers:
+            message = "Overdue accounts:\n\n"
+            for customer in overdue_customers:
+                name = customer['name']
+                old_balance = customer['old_balance']
+                new_balance = customer['new_balance']
+                status = customer['status']
+                penalty_added = customer['penalty_added']
+
+                if penalty_added:
+                    message += f"{name}: ₱{old_balance:.2f} → ₱{new_balance:.2f} ({status})\n"
+                else:
+                    message += f"{name}: ₱{old_balance:.2f} ({status})\n"
+
+            # Refresh the customer list to show updated balances
+            self.load_customers()
+            show_message("Overdue Accounts", message)
+        else:
+            show_message("Reminders", "No overdue accounts found.")
+
 
 if __name__ == '__main__':
     UTrackerApp().run()
